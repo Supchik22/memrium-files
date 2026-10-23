@@ -1,0 +1,15 @@
+[package]
+name = "memrium-files"
+version = "0.1.0"
+edition = "2021"
+description = "A file manager that shares its operations, trash and undo with the Memrium desktop."
+license = "MIT"
+repository = "https://github.com/Supchik22/memrium-files"
+
+[[bin]]
+name = "memrium_files"
+path = "src/main.rs"
+
+[dependencies]
+chebrium = { git = "https://github.com/Supchik22/chebrium" }
+memrium-de = { git = "https://github.com/Supchik22/memrium" }
