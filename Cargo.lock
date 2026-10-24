@@ -1628,8 +1628,12 @@ dependencies = [
 name = "memrium-files"
 version = "0.1.0"
 dependencies = [
+ "blocking",
  "chebrium",
+ "libc",
  "memrium-de",
+ "serde_json",
+ "zbus",
 ]
 
 [[package]]
