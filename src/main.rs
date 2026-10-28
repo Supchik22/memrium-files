@@ -1,11 +1,16 @@
 //! Memrium Files: a file manager built on Chebrium. A standalone Wayland client (software-drawn, redraws only
 //! while something moves) that shares its file operations, trash and undo with the desktop through `fsops`.
 
-use chebrium::app::{self, App, Config, Host};
+mod chooser;
+
+use chebrium::app::{self, App, Config, Decorations, Host};
+use chebrium::chrome;
 use chebrium::appmenu::{Item, Menu};
 use chebrium::draw::Align;
 use chebrium::input::{Key, KeyMods};
+use chebrium::spring::Spring;
 use chebrium::ui::{inside, Ui};
+use chooser::{Chooser, Mode};
 use memrium_de::fsops::{self, Entry, Fm, SortBy};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,6 +21,8 @@ const TOP_H: f32 = 52.0;
 const HEAD_H: f32 = 28.0;
 const ROW_H: f32 = 32.0;
 const STATUS_H: f32 = 28.0;
+/// the bar of the file dialog (name, filter, buttons) above the status line
+const BAR_H: f32 = 56.0;
 const SCROLL_KEY: u64 = 90_000;
 
 struct Place {
@@ -94,10 +101,17 @@ struct FilesApp {
     rename_buf: String,
     error: String,
     title: String,
+    /// the file dialog the portal asked for (None: the ordinary file manager)
+    chooser: Option<Chooser>,
+    /// the answer was given: close the window on the next chance
+    done: bool,
+    /// the sidebar's one highlight: x, y, w, h and opacity
+    side_hl: [Spring; 5],
+    side_hl_init: bool,
 }
 
 impl FilesApp {
-    fn new(start: PathBuf) -> FilesApp {
+    fn new(start: PathBuf, chooser: Option<Chooser>) -> FilesApp {
         let mut app = FilesApp {
             cwd: start,
             back: Vec::new(),
@@ -119,6 +133,10 @@ impl FilesApp {
             error: String::new(),
             title: String::new(),
             app_icons: AppIcons::default(),
+            chooser,
+            done: false,
+            side_hl: [Spring::new(0.0, 2200.0, 1.0), Spring::new(0.0, 2200.0, 1.0), Spring::new(0.0, 2200.0, 1.0), Spring::new(0.0, 2200.0, 1.0), Spring::new(0.0, 2400.0, 1.0)],
+            side_hl_init: false,
         };
         app.reload();
         app
@@ -130,8 +148,11 @@ impl FilesApp {
             fsops::drives()
         } else {
             match fsops::list_dir(&self.cwd, self.hidden, self.sort, self.desc, true) {
-                Ok(e) => {
+                Ok(mut e) => {
                     self.error.clear();
+                    if let Some(c) = &self.chooser {
+                        e.retain(|x| c.shows(x));
+                    }
                     e
                 }
                 Err(e) => {
@@ -160,6 +181,9 @@ impl FilesApp {
         self.scroll = 0.0;
         self.renaming = None;
         self.fm.note.clear();
+        if let Some(c) = &mut self.chooser {
+            c.replace = false;
+        }
         self.reload();
     }
 
@@ -199,9 +223,60 @@ impl FilesApp {
     fn select_only(&mut self, i: usize) {
         self.sel = vec![self.entries[i].path.clone()];
         self.cursor = Some(i);
+        // saving over an existing file: its name goes into the field
+        let e = &self.entries[i];
+        if let Some(c) = self.chooser.as_mut().filter(|c| c.mode == Mode::Save && !e.is_dir) {
+            c.name = e.name.clone();
+            c.replace = false;
+        }
+    }
+
+    /// Whether several rows may be selected (not in a dialog that wants one file).
+    fn multi(&self) -> bool {
+        self.chooser.as_ref().map_or(true, |c| c.multiple && c.mode != Mode::Save)
+    }
+
+    /// Whether the dialog's main button can be pressed.
+    fn can_accept(&self) -> bool {
+        let Some(c) = &self.chooser else { return false };
+        let computer = fsops::is_computer(&self.cwd);
+        match c.mode {
+            Mode::Open => self.sel.iter().any(|p| self.entries.iter().any(|e| &e.path == p && !e.is_dir)),
+            Mode::Dir => !computer || !self.sel.is_empty(),
+            Mode::Save => !computer && !c.name.trim().is_empty() && !c.name.contains('/'),
+        }
+    }
+
+    /// The main button of the dialog: gives the answer (saving over a file asks once more first).
+    fn accept(&mut self) {
+        if !self.can_accept() {
+            return;
+        }
+        let cwd = self.cwd.clone();
+        let sel_dirs: Vec<PathBuf> = self.entries.iter().filter(|e| e.is_dir && self.sel.contains(&e.path)).map(|e| e.path.clone()).collect();
+        let sel_files: Vec<PathBuf> = self.entries.iter().filter(|e| !e.is_dir && self.sel.contains(&e.path)).map(|e| e.path.clone()).collect();
+        let Some(c) = self.chooser.as_mut() else { return };
+        let paths = match c.mode {
+            Mode::Open => sel_files,
+            Mode::Dir if sel_dirs.is_empty() => vec![cwd],
+            Mode::Dir => sel_dirs,
+            Mode::Save => {
+                let path = cwd.join(c.name.trim());
+                if path.exists() && !c.replace {
+                    c.replace = true;
+                    return;
+                }
+                vec![path]
+            }
+        };
+        c.emit(&paths);
+        self.done = true;
     }
 
     fn toggle(&mut self, i: usize) {
+        if !self.multi() {
+            return self.select_only(i);
+        }
         let p = self.entries[i].path.clone();
         match self.sel.iter().position(|q| *q == p) {
             Some(at) => {
@@ -216,6 +291,9 @@ impl FilesApp {
         let e = self.entries[i].clone();
         if e.is_dir {
             self.go(e.path);
+        } else if self.chooser.is_some() {
+            self.select_only(i);
+            self.accept();
         } else {
             fsops::open_external(&e.path, &std::env::var("WAYLAND_DISPLAY").unwrap_or_default());
         }
@@ -327,7 +405,7 @@ fn icon_button(ui: &mut Ui<'_>, cx: f32, cy: f32, icon: &str, enabled: bool) -> 
     let hov = enabled && ui.hit(r);
     let key = ui.id() * 64;
     let wash = ui.ease(key, if hov { 1.0 } else { 0.0 }, 22.0);
-    ui.fill(r, 9.0, ui.ink, 0.10 * wash);
+    ui.fill(r, 15.0, ui.ink, 0.10 * wash);
     ui.glyph(cx, cy, 17.0, icon, ui.ink, if enabled { 0.9 } else { 0.28 });
     ui.click && hov
 }
@@ -402,6 +480,19 @@ impl App for FilesApp {
 
     fn key(&mut self, key: Key, mods: KeyMods, host: &mut Host) {
         host.redraw = true;
+        self.key_inner(key, mods, host);
+        host.quit |= self.done;
+    }
+
+    fn draw(&mut self, ui: &mut Ui<'_>, size: [f32; 2], host: &mut Host) {
+        chrome::resize_borders(ui, host, size);
+        self.draw_inner(ui, size, host);
+        host.quit |= self.done;
+    }
+}
+
+impl FilesApp {
+    fn key_inner(&mut self, key: Key, mods: KeyMods, host: &mut Host) {
         match key {
             Key::Left if mods.alt => self.go_back(),
             Key::Right if mods.alt => self.go_forward(),
@@ -426,9 +517,10 @@ impl App for FilesApp {
             Key::Delete => self.trash_selected(),
             Key::F2 => self.want_rename = self.sel.len() == 1,
             Key::F5 => self.reload(),
+            Key::Esc if self.chooser.is_some() => host.quit = true,
             Key::Esc => self.sel.clear(),
             Key::Char(c) if mods.ctrl => match c {
-                'a' => self.sel = self.entries.iter().map(|e| e.path.clone()).collect(),
+                'a' if self.multi() => self.sel = self.entries.iter().map(|e| e.path.clone()).collect(),
                 'c' => self.fm.set_clip(self.selected_paths(), false),
                 'x' => self.fm.set_clip(self.selected_paths(), true),
                 'v' => self.paste(),
@@ -447,7 +539,7 @@ impl App for FilesApp {
         }
     }
 
-    fn draw(&mut self, ui: &mut Ui<'_>, size: [f32; 2], host: &mut Host) {
+    fn draw_inner(&mut self, ui: &mut Ui<'_>, size: [f32; 2], host: &mut Host) {
         let [w, h] = size;
         if self.fm.gen != self.gen {
             self.gen = self.fm.gen;
@@ -455,7 +547,13 @@ impl App for FilesApp {
         }
         let accent = ui.accent;
         let ink = ui.ink;
-        let list = [SIDE_W, TOP_H + HEAD_H, w - SIDE_W, (h - TOP_H - HEAD_H - STATUS_H).max(ROW_H)];
+        let dark = ink[0] > 0.5;
+        let paper = if dark { [0.0; 3] } else { [1.0; 3] };
+        // the content is a sheet of paper next to the sidebar's floating glass
+        ui.fill([SIDE_W, 0.0, w - SIDE_W, h], 0.0, paper, if dark { 0.32 } else { 0.78 });
+        // the file dialog adds a bar for the name, the filter and the buttons below the list
+        let foot = if self.chooser.is_some() { BAR_H } else { 0.0 };
+        let list = [SIDE_W, TOP_H + HEAD_H, w - SIDE_W, (h - TOP_H - HEAD_H - STATUS_H - foot).max(ROW_H)];
 
         // keep the scroll range sensible, honour the wheel and bring the keyboard cursor into view
         let max_scroll = (self.entries.len() as f32 * ROW_H + 8.0 - list[3]).max(0.0);
@@ -539,7 +637,7 @@ impl App for FilesApp {
             }
             if ui.click && hov {
                 clicked_row = true;
-                if ui.mods.ctrl {
+                if ui.mods.ctrl && self.multi() {
                     self.toggle(i);
                 } else if !(selected && self.sel.len() > 1) || ui.double {
                     self.select_only(i);
@@ -601,61 +699,168 @@ impl App for FilesApp {
             self.sort_by(by);
         }
 
-        // ---- top bar: navigation, the path, actions
+        let title = if let Some(c) = &self.chooser {
+            c.title.clone()
+        } else if computer { "This computer".to_string() } else { self.cwd.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Files".into()) };
+        if title != self.title {
+            host.title = Some(title.clone());
+            self.title = title;
+        }
+
+        // ---- toolbar in the title row: a back/forward pill, the folder's name, a pill of actions. The window's own
+        // buttons sit over the sidebar's corner, so the row is one piece with the window's top edge.
         let cy = TOP_H / 2.0;
-        let mut x = SIDE_W + 22.0;
-        if icon_button(ui, x, cy, "arrow-left", !self.back.is_empty()) {
+        let pill_x = SIDE_W + 14.0;
+        ui.fill([pill_x, cy - 16.0, 68.0, 32.0], 16.0, ink, 0.065);
+        if icon_button(ui, pill_x + 18.0, cy, "chevron-left", !self.back.is_empty()) {
             self.go_back();
         }
-        x += 34.0;
-        if icon_button(ui, x, cy, "arrow-right", !self.forward.is_empty()) {
+        if icon_button(ui, pill_x + 50.0, cy, "chevron-right", !self.forward.is_empty()) {
             self.go_forward();
         }
-        x += 34.0;
-        if icon_button(ui, x, cy, "arrow-up", !computer && self.cwd.parent().is_some()) {
+        let actions_w = 5.0 * 32.0 + 8.0;
+        let actions_x = w - actions_w - 14.0;
+        ui.fill([actions_x, cy - 16.0, actions_w, 32.0], 16.0, ink, 0.065);
+        let mut ax = actions_x + 20.0;
+        if icon_button(ui, ax, cy, "arrow-up", !computer && self.cwd.parent().is_some()) {
             self.go_up();
         }
-        x += 34.0;
-        if icon_button(ui, x, cy, "refresh-cw", true) {
+        ax += 32.0;
+        if icon_button(ui, ax, cy, "refresh-cw", true) {
             self.reload();
         }
-        let actions = 3.0 * 34.0 + 12.0;
-        let field = [x + 24.0, 10.0, (w - actions - (x + 24.0) - 12.0).max(80.0), TOP_H - 20.0];
-        ui.fill(field, 10.0, ink, 0.07);
-        let path = fit(ui, &self.shown_path(), 13.0, false, field[2] - 24.0);
-        ui.text_raw(field[0] + 12.0, cy + 4.8, &path, 13.0, false, ink, 0.9, Align::Left);
-        let mut ax = field[0] + field[2] + 28.0;
+        ax += 32.0;
         if icon_button(ui, ax, cy, "folder-plus", !computer) {
             self.new_folder();
         }
-        ax += 34.0;
+        ax += 32.0;
         if icon_button(ui, ax, cy, "trash-2", !self.sel.is_empty()) {
             self.trash_selected();
         }
-        ax += 34.0;
+        ax += 32.0;
         if icon_button(ui, ax, cy, if self.hidden { "eye" } else { "eye-off" }, true) {
             self.hidden = !self.hidden;
             self.reload();
         }
+        let title_x = pill_x + 68.0 + 16.0;
+        let title_w = (actions_x - 12.0 - title_x).max(60.0);
+        let name = fit(ui, &self.title, 15.0, true, title_w);
+        ui.text_raw(title_x, cy - 1.5, &name, 15.0, true, ink, 0.95, Align::Left);
+        let path = fit(ui, &self.shown_path(), 11.0, false, title_w);
+        ui.text_raw(title_x, cy + 13.0, &path, 11.0, false, ink, 0.5, Align::Left);
+        // a press on the bare toolbar moves the window, twice maximises it
+        let on_widget = ui.hit([pill_x, 0.0, 68.0, TOP_H]) || ui.hit([actions_x, 0.0, actions_w, TOP_H]);
+        chrome::integrated(ui, host, size, TOP_H, on_widget);
 
         // ---- status bar
-        let status = self.status();
-        ui.text_raw(SIDE_W + 18.0, h - 10.0, &status, 12.0, false, ink, 0.55, Align::Left);
+        let mut status = self.status();
+        if let Some(c) = self.chooser.as_ref().filter(|c| c.replace) {
+            status = chebrium::i18n::trf("“{}” already exists. Replace it?", &[c.name.trim().to_string()]);
+        }
+        ui.text_raw(SIDE_W + 18.0, h - foot - 10.0, &status, 12.0, false, ink, if foot > 0.0 && self.chooser.as_ref().is_some_and(|c| c.replace) { 0.9 } else { 0.55 }, Align::Left);
+
+        // ---- the file dialog's bar: [name] [filter] [Cancel] [Open]
+        if self.chooser.is_some() {
+            let can = self.can_accept();
+            let bar = [SIDE_W, h - foot, w - SIDE_W, foot];
+            ui.fill([bar[0], bar[1], bar[2], 1.0], 0.0, ink, 0.10);
+            let by = bar[1] + (foot - 32.0) / 2.0;
+            let mut x = w - 16.0;
+            let (mut cancel, mut ok, mut cycle) = (false, false, false);
+            let (label, filter_name, many) = {
+                let c = self.chooser.as_ref().unwrap();
+                let label = if c.replace { "Replace".to_string() } else { c.accept.clone() };
+                (label, c.filters.get(c.filter).map(|f| f.name.clone()), c.filters.len() > 1)
+            };
+            x -= 110.0;
+            if can {
+                ok = ui.button([x, by, 110.0, 32.0], &label, true);
+            } else {
+                ui.fill([x, by, 110.0, 32.0], 8.0, ink, 0.06);
+                ui.text(x + 55.0, by + 20.5, &label, 12.5, true, ink, 0.3, Align::Center);
+            }
+            x -= 8.0 + 90.0;
+            cancel |= ui.button([x, by, 90.0, 32.0], "Cancel", false);
+            if let Some(name) = filter_name {
+                x -= 8.0 + 190.0;
+                let shown = fit(ui, &name, 12.5, false, 150.0);
+                let r = [x, by, 190.0, 32.0];
+                let hov = many && ui.hit(r);
+                ui.fill(r, 8.0, ink, if hov { 0.14 } else { 0.08 });
+                ui.text_raw(r[0] + 12.0, by + 20.5, &shown, 12.5, false, ink, 0.95, Align::Left);
+                if many {
+                    ui.glyph(r[0] + r[2] - 16.0, by + 16.0, 14.0, "chevrons-up-down", ink, 0.6);
+                }
+                cycle = ui.click && hov;
+            }
+            let mut name_changed = false;
+            if self.chooser.as_ref().is_some_and(|c| c.mode == Mode::Save) {
+                let c = self.chooser.as_mut().unwrap();
+                if c.focus_name {
+                    c.focus_name = false;
+                    ui.begin_edit("choose-name", &c.name);
+                }
+                let mut buf = c.name.clone();
+                name_changed = ui.text_field([bar[0] + 16.0, by, (x - 12.0 - bar[0] - 16.0).max(120.0), 32.0], "choose-name", &mut buf);
+                if name_changed {
+                    c.name = buf;
+                    c.replace = false;
+                }
+            }
+            if cancel {
+                host.quit = true;
+            }
+            if cycle {
+                if let Some(c) = self.chooser.as_mut() {
+                    c.filter = (c.filter + 1) % c.filters.len();
+                }
+                self.reload();
+            }
+            if ok {
+                self.accept();
+            }
+            host.redraw |= name_changed || cycle;
+        }
 
         // ---- sidebar
-        ui.fill([0.0, 0.0, SIDE_W, h], 0.0, ink, 0.045);
-        ui.fill([SIDE_W - 1.0, 0.0, 1.0, h], 0.0, ink, 0.08);
+        let panel = [8.0, 8.0, SIDE_W - 16.0, h - 16.0];
+        ui.fill(panel, 18.0, paper, if dark { 0.06 } else { 0.42 });
+        ui.fill([panel[0], panel[1], panel[2], 1.0], 0.0, [1.0; 3], if dark { 0.05 } else { 0.5 });
+        // one highlight glides to the place the window is in (the way the shell's menus do)
+        let row = |i: usize| [16.0, 56.0 + i as f32 * 36.0, SIDE_W - 32.0, 32.0];
+        match self.places.iter().position(|p| self.cwd == p.path) {
+            Some(i) => {
+                for (s, v) in self.side_hl.iter_mut().zip(row(i)) {
+                    s.target = v;
+                }
+                self.side_hl[4].target = 1.0;
+                if !self.side_hl_init {
+                    self.side_hl_init = true;
+                    for s in self.side_hl.iter_mut() {
+                        s.snap();
+                    }
+                    self.side_hl[4].x = 0.0;
+                }
+            }
+            None => self.side_hl[4].target = 0.0,
+        }
+        let dt = ui.dt();
+        for s in self.side_hl.iter_mut() {
+            s.update(dt);
+        }
+        host.redraw |= self.side_hl.iter().any(|s| !s.at_rest());
+        let a = self.side_hl[4].x.clamp(0.0, 1.0);
+        let [hx, hy, hw, hh] = [self.side_hl[0].x, self.side_hl[1].x, self.side_hl[2].x.max(0.0), self.side_hl[3].x.max(0.0)];
+        ui.fill([hx, hy, hw, hh], 10.0, ink, 0.09 * a);
         let mut go = None;
         for (i, p) in self.places.iter().enumerate() {
-            let r = [10.0, 14.0 + i as f32 * 38.0, SIDE_W - 20.0, 34.0];
+            let r = row(i);
             let here = self.cwd == p.path;
             let hov = ui.hit(r);
             let wash = ui.ease(40_000 + i as u64, if hov { 1.0 } else { 0.0 }, 22.0);
-            let on = ui.ease(41_000 + i as u64, if here { 1.0 } else { 0.0 }, 16.0);
-            ui.fill(r, 9.0, ink, 0.07 * wash * (1.0 - on));
-            ui.fill(r, 9.0, accent, 0.22 * on);
-            ui.glyph(r[0] + 20.0, r[1] + r[3] / 2.0, 16.0, p.icon, if here { accent } else { ink }, if here { 1.0 } else { 0.8 });
-            ui.text(r[0] + 42.0, r[1] + r[3] / 2.0 + 4.8, &p.name, 13.5, here, ink, 0.95, Align::Left);
+            ui.fill(r, 10.0, ink, 0.07 * wash * if here { 0.0 } else { 1.0 });
+            ui.glyph(r[0] + 18.0, r[1] + r[3] / 2.0, 16.0, p.icon, accent, 1.0);
+            ui.text(r[0] + 40.0, r[1] + r[3] / 2.0 + 4.8, &p.name, 13.5, here, ink, 0.95, Align::Left);
             if ui.click && hov {
                 go = Some(p.path.clone());
             }
@@ -664,15 +869,14 @@ impl App for FilesApp {
             self.go(p);
         }
 
-        let title = if computer { "This computer".to_string() } else { self.cwd.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Files".into()) };
-        if title != self.title {
-            host.title = Some(title.clone());
-            self.title = title;
-        }
     }
 }
 
 fn main() {
-    let start = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_dir()).unwrap_or_else(fsops::home);
-    app::run(Config::new("Memrium Files", "memrium-files").size(960, 620).min_size(560, 360), FilesApp::new(start));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (chooser, start) = Chooser::from_args(&args);
+    let start = start.unwrap_or_else(fsops::home);
+    let title = chooser.as_ref().map_or("Memrium Files".to_string(), |c| c.title.clone());
+    let (w, h) = if chooser.is_some() { (880, 580) } else { (960, 620) };
+    app::run(Config::new(&title, "memrium-files").size(w, h).min_size(560, 360).decorations(Decorations::Client), FilesApp::new(start, chooser));
 }

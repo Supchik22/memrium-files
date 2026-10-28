@@ -13,3 +13,4 @@ path = "src/main.rs"
 [dependencies]
 chebrium = { git = "https://github.com/Supchik22/chebrium" }
 memrium-de = { git = "https://github.com/Supchik22/memrium" }
+serde_json = "1"
