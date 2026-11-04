@@ -10,6 +10,7 @@ use chebrium::draw::Align;
 use chebrium::input::{Key, KeyMods};
 use chebrium::spring::Spring;
 use chebrium::ui::{inside, Ui};
+use chebrium::widgets::{self, fit, round_button, Round};
 use chooser::{Chooser, Mode};
 use memrium_de::fsops::{self, Entry, Fm, SortBy};
 use std::collections::HashMap;
@@ -19,11 +20,12 @@ use std::sync::{Arc, OnceLock};
 const SIDE_W: f32 = 200.0;
 const TOP_H: f32 = 52.0;
 const HEAD_H: f32 = 28.0;
+/// the row of labelled actions (New, Cut, Copy ...) under the title row, as in Dolphin
+const ACT_H: f32 = 40.0;
 const ROW_H: f32 = 32.0;
 const STATUS_H: f32 = 28.0;
 /// the bar of the file dialog (name, filter, buttons) above the status line
 const BAR_H: f32 = 56.0;
-const SCROLL_KEY: u64 = 90_000;
 
 struct Place {
     name: String,
@@ -89,9 +91,17 @@ struct FilesApp {
     sort: SortBy,
     desc: bool,
     hidden: bool,
+    /// the labelled action row and the optional columns (View menu)
+    labels: bool,
+    col_kind: bool,
+    col_size: bool,
+    col_date: bool,
     fm: Fm,
     gen: u64,
     places: Vec<Place>,
+    /// mounted disks under the places, with how full they are (read again every few seconds)
+    devices: Vec<fsops::Mount>,
+    devices_at: std::time::Instant,
     /// where the list wants to be scrolled to (the drawn position eases towards it)
     scroll: f32,
     /// bring the cursor row into view on the next frame
@@ -122,9 +132,15 @@ impl FilesApp {
             sort: SortBy::Name,
             desc: false,
             hidden: false,
+            labels: true,
+            col_kind: true,
+            col_size: true,
+            col_date: true,
             fm: Fm::default(),
             gen: 0,
             places: places(),
+            devices: fsops::mounts(),
+            devices_at: std::time::Instant::now(),
             scroll: 0.0,
             reveal: false,
             renaming: None,
@@ -388,26 +404,9 @@ impl FilesApp {
     }
 }
 
-/// `text`, cut short with an ellipsis so it is no wider than `max`.
-fn fit(ui: &mut Ui<'_>, text: &str, size: f32, bold: bool, max: f32) -> String {
-    if ui.measure_raw(text, size, bold) <= max {
-        return text.to_string();
-    }
-    let mut s = text.to_string();
-    while !s.is_empty() && ui.measure_raw(&format!("{s}…"), size, bold) > max {
-        s.pop();
-    }
-    format!("{s}…")
-}
-
+/// The toolbar's round buttons (back, forward, up ...).
 fn icon_button(ui: &mut Ui<'_>, cx: f32, cy: f32, icon: &str, enabled: bool) -> bool {
-    let r = [cx - 15.0, cy - 15.0, 30.0, 30.0];
-    let hov = enabled && ui.hit(r);
-    let key = ui.id() * 64;
-    let wash = ui.ease(key, if hov { 1.0 } else { 0.0 }, 22.0);
-    ui.fill(r, 15.0, ui.ink, 0.10 * wash);
-    ui.glyph(cx, cy, 17.0, icon, ui.ink, if enabled { 0.9 } else { 0.28 });
-    ui.click && hov
+    round_button(ui, cx, cy, icon, Round::ink(30.0).glyph(17.0).enabled(enabled))
 }
 
 /// The entries of the menu bar that do what a key does: (id, key, ctrl, alt).
@@ -429,6 +428,8 @@ const MENU_KEYS: [(u32, Key, bool, bool); 14] = [
 ];
 const MENU_SORT: u32 = 40;
 const MENU_HIDDEN: u32 = 21;
+const MENU_LABELS: u32 = 22;
+const MENU_COLS: u32 = 60;
 const MENU_GO: u32 = 50;
 
 impl App for FilesApp {
@@ -442,6 +443,9 @@ impl App for FilesApp {
                 vec![
                     Item::new(MENU_HIDDEN, "Show Hidden Files").key("Ctrl+H").checked(self.hidden),
                     Item::new(20, "Refresh").key("F5"),
+                    Item::sep(),
+                    Item::new(MENU_LABELS, "Show Action Bar").checked(self.labels),
+                    Item::parent("Columns", vec![Item::new(MENU_COLS, "Type").checked(self.col_kind), Item::new(MENU_COLS + 1, "Size").checked(self.col_size), Item::new(MENU_COLS + 2, "Modified").checked(self.col_date)]),
                     Item::sep(),
                     Item::parent("Sort by", vec![sort(0, "Name", SortBy::Name), sort(1, "Size", SortBy::Size), sort(2, "Date modified", SortBy::Modified), sort(3, "Type", SortBy::Kind)]),
                 ],
@@ -461,6 +465,10 @@ impl App for FilesApp {
                 self.hidden = !self.hidden;
                 self.reload();
             }
+            MENU_LABELS => self.labels = !self.labels,
+            MENU_COLS => self.col_kind = !self.col_kind,
+            i if i == MENU_COLS + 1 => self.col_size = !self.col_size,
+            i if i == MENU_COLS + 2 => self.col_date = !self.col_date,
             i if (MENU_SORT..MENU_SORT + 4).contains(&i) => self.sort_by([SortBy::Name, SortBy::Size, SortBy::Modified, SortBy::Kind][(i - MENU_SORT) as usize]),
             i if (MENU_GO..MENU_GO + 4).contains(&i) => {
                 let h = fsops::home();
@@ -553,26 +561,18 @@ impl FilesApp {
         ui.fill([SIDE_W, 0.0, w - SIDE_W, h], 0.0, paper, if dark { 0.32 } else { 0.78 });
         // the file dialog adds a bar for the name, the filter and the buttons below the list
         let foot = if self.chooser.is_some() { BAR_H } else { 0.0 };
-        let list = [SIDE_W, TOP_H + HEAD_H, w - SIDE_W, (h - TOP_H - HEAD_H - STATUS_H - foot).max(ROW_H)];
+        // the dialog stays plain; the file manager has the labelled action row under the title row
+        let act = if self.chooser.is_none() && self.labels { ACT_H } else { 0.0 };
+        let top = TOP_H + act;
+        let list = [SIDE_W, top + HEAD_H, w - SIDE_W, (h - top - HEAD_H - STATUS_H - foot).max(ROW_H)];
 
-        // keep the scroll range sensible, honour the wheel and bring the keyboard cursor into view
-        let max_scroll = (self.entries.len() as f32 * ROW_H + 8.0 - list[3]).max(0.0);
-        if ui.scroll != 0.0 && inside(ui.mouse, list) {
-            self.scroll += ui.scroll;
-        }
+        // bring the keyboard cursor into view (the scroll area below keeps the range and takes the wheel)
         if self.reveal {
             self.reveal = false;
             if let Some(c) = self.cursor {
-                let (top, bottom) = (c as f32 * ROW_H, (c + 1) as f32 * ROW_H + 8.0);
-                if top < self.scroll {
-                    self.scroll = top;
-                } else if bottom > self.scroll + list[3] {
-                    self.scroll = bottom - list[3];
-                }
+                widgets::reveal(&mut self.scroll, c as f32 * ROW_H, (c + 1) as f32 * ROW_H + 8.0, list[3]);
             }
         }
-        self.scroll = self.scroll.clamp(0.0, max_scroll);
-        let scroll = ui.ease(SCROLL_KEY, self.scroll, 18.0);
 
         // F2 or a new folder: start renaming the selected row
         if self.want_rename {
@@ -588,23 +588,31 @@ impl FilesApp {
 
         // ---- the list (drawn first; the bars below cover whatever sticks out)
         let computer = fsops::is_computer(&self.cwd);
+        // columns from the right edge: Size (right aligned), Modified, Type; the name gets what is left
+        let mut edge = w - 24.0;
+        let size_x = (!computer && self.col_size).then(|| {
+            let x = edge;
+            edge -= 84.0;
+            x
+        });
+        let date_x = (!computer && self.col_date).then(|| {
+            edge -= 150.0;
+            edge
+        });
+        let kind_x = (!computer && self.col_kind).then(|| {
+            edge -= 120.0;
+            edge
+        });
         let n = self.entries.len();
-        let first = (scroll / ROW_H).floor().max(0.0) as usize;
-        let last = (((scroll + list[3]) / ROW_H).ceil() as usize + 1).min(n);
         let (mut open, mut clicked_row) = (None, false);
         let mut renamed = None;
-        ui.push_clip(list);
-        for i in first..last {
+        let area = widgets::scroll_area(ui, list, n as f32 * ROW_H + 8.0, &mut self.scroll);
+        for i in area.rows(ROW_H, n) {
             let e = self.entries[i].clone();
-            let r = [list[0] + 8.0, list[1] - scroll + 4.0 + i as f32 * ROW_H, list[2] - 16.0, ROW_H - 2.0];
-            let hov = ui.hit(r) && inside(ui.mouse, list);
+            let r = [list[0] + 8.0, area.y(4.0 + i as f32 * ROW_H), list[2] - 16.0, ROW_H - 2.0];
+            let hov = area.hit(ui, r);
             let selected = self.sel.contains(&e.path);
-            let wash = ui.ease(30_000 + i as u64, if hov { 1.0 } else { 0.0 }, 22.0);
-            if selected {
-                ui.fill(r, 8.0, accent, 0.28);
-            } else if wash > 0.01 {
-                ui.fill(r, 8.0, ink, 0.07 * wash);
-            }
+            widgets::list_row(ui, r, 8.0, 30_000 + i as u64, hov, selected);
             if self.cursor == Some(i) && selected {
                 ui.fill([r[0], r[1] + 6.0, 3.0, r[3] - 12.0], 1.5, accent, 1.0);
             }
@@ -617,8 +625,7 @@ impl FilesApp {
             }
             // the themes are still being read: look again shortly
             host.redraw |= wait;
-            let right = r[0] + r[2] - 16.0;
-            let (mod_x, name_max) = if computer { (right, right - r[0] - 60.0) } else { (right - 110.0 - 150.0, right - 110.0 - 150.0 - r[0] - 56.0) };
+            let name_max = edge - r[0] - 56.0;
             if self.renaming.as_ref() == Some(&e.path) {
                 let mut buf = self.rename_buf.clone();
                 if ui.text_field([r[0] + 40.0, r[1] + 1.0, name_max.min(360.0), r[3] - 2.0], "rename", &mut buf) {
@@ -629,11 +636,14 @@ impl FilesApp {
                 let name = fit(ui, e.title(), 13.5, false, name_max);
                 ui.text_raw(r[0] + 44.0, cy + 4.8, &name, 13.5, false, ink, if e.hidden { 0.55 } else { 0.95 }, Align::Left);
             }
-            if !computer {
-                ui.text_raw(mod_x, cy + 4.5, &fsops::format_time(e.modified), 12.0, false, ink, 0.55, Align::Left);
-                if !e.is_dir {
-                    ui.text_raw(right, cy + 4.5, &fsops::human_size(e.size), 12.0, false, ink, 0.55, Align::Right);
-                }
+            if let Some(x) = kind_x {
+                ui.text_raw(x, cy + 4.5, e.kind.label(), 12.0, false, ink, 0.55, Align::Left);
+            }
+            if let Some(x) = date_x {
+                ui.text_raw(x, cy + 4.5, &fsops::format_time(e.modified), 12.0, false, ink, 0.55, Align::Left);
+            }
+            if let (Some(x), false) = (size_x, e.is_dir) {
+                ui.text_raw(x, cy + 4.5, &fsops::human_size(e.size), 12.0, false, ink, 0.55, Align::Right);
             }
             if ui.click && hov {
                 clicked_row = true;
@@ -647,7 +657,7 @@ impl FilesApp {
                 }
             }
         }
-        ui.pop_clip();
+        area.end(ui);
         if ui.click && inside(ui.mouse, list) && !clicked_row && self.renaming.is_none() {
             self.sel.clear();
         }
@@ -671,27 +681,33 @@ impl FilesApp {
         }
 
         // ---- column header
-        ui.fill([SIDE_W + 8.0, TOP_H + HEAD_H - 1.0, w - SIDE_W - 16.0, 1.0], 0.0, ink, 0.10);
-        let right = w - 8.0 - 16.0;
+        ui.fill([SIDE_W + 8.0, top + HEAD_H - 1.0, w - SIDE_W - 16.0, 1.0], 0.0, ink, 0.10);
         let mut sort_to = None;
         let head = |ui: &mut Ui<'_>, label: &str, x: f32, align: Align, by: SortBy, width: f32, sort: SortBy, desc: bool| {
             let rx = if align == Align::Right { x - width } else { x };
-            let hov = ui.hit([rx - 4.0, TOP_H, width + 8.0, HEAD_H]);
-            ui.text(x, TOP_H + 18.5, label, 11.5, true, ink, if sort == by { 0.9 } else if hov { 0.8 } else { 0.5 }, align);
+            let hov = ui.hit([rx - 4.0, top, width + 8.0, HEAD_H]);
+            ui.text(x, top + 18.5, label, 11.5, true, ink, if sort == by { 0.9 } else if hov { 0.8 } else { 0.5 }, align);
             if sort == by {
                 let ax = if align == Align::Right { x - ui.measure(label, 11.5, true) - 10.0 } else { x + ui.measure(label, 11.5, true) + 10.0 };
-                ui.glyph(ax, TOP_H + 14.0, 12.0, if desc { "chevron-down" } else { "chevron-up" }, ink, 0.8);
+                ui.glyph(ax, top + 14.0, 12.0, if desc { "chevron-down" } else { "chevron-up" }, ink, 0.8);
             }
             ui.click && hov
         };
         if head(ui, "Name", SIDE_W + 52.0, Align::Left, SortBy::Name, 80.0, self.sort, self.desc) {
             sort_to = Some(SortBy::Name);
         }
-        if !computer {
-            if head(ui, "Modified", right - 110.0 - 150.0 + 8.0 + 8.0, Align::Left, SortBy::Modified, 100.0, self.sort, self.desc) {
+        if let Some(x) = kind_x {
+            if head(ui, "Type", x + 16.0, Align::Left, SortBy::Kind, 60.0, self.sort, self.desc) {
+                sort_to = Some(SortBy::Kind);
+            }
+        }
+        if let Some(x) = date_x {
+            if head(ui, "Modified", x + 16.0, Align::Left, SortBy::Modified, 100.0, self.sort, self.desc) {
                 sort_to = Some(SortBy::Modified);
             }
-            if head(ui, "Size", right + 8.0, Align::Right, SortBy::Size, 60.0, self.sort, self.desc) {
+        }
+        if let Some(x) = size_x {
+            if head(ui, "Size", x + 8.0, Align::Right, SortBy::Size, 60.0, self.sort, self.desc) {
                 sort_to = Some(SortBy::Size);
             }
         }
@@ -751,6 +767,43 @@ impl FilesApp {
         // a press on the bare toolbar moves the window, twice maximises it
         let on_widget = ui.hit([pill_x, 0.0, 68.0, TOP_H]) || ui.hit([actions_x, 0.0, actions_w, TOP_H]);
         chrome::integrated(ui, host, size, TOP_H, on_widget);
+
+        // ---- the labelled action row: New, Cut, Copy, Paste, Rename, Delete (the Dolphin side of the window)
+        if act > 0.0 {
+            ui.fill([SIDE_W + 8.0, TOP_H + act - 1.0, w - SIDE_W - 16.0, 1.0], 0.0, ink, 0.07);
+            let one = self.sel.len() == 1;
+            let some = !self.sel.is_empty();
+            let acts: [(&str, &str, bool); 6] = [
+                ("folder-plus", "New", !computer),
+                ("scissors", "Cut", some),
+                ("copy", "Copy", some),
+                ("clipboard-paste", "Paste", !computer && self.fm.can_paste()),
+                ("pencil", "Rename", one),
+                ("trash-2", "Delete", some),
+            ];
+            let mut x = SIDE_W + 14.0;
+            for (i, (icon, label, on)) in acts.into_iter().enumerate() {
+                let tw = ui.measure_raw(label, 12.5, false);
+                let r = [x, TOP_H + 4.0, 38.0 + tw, act - 9.0];
+                let hov = on && ui.hit(r);
+                let wash = ui.ease(42_000 + i as u64, if hov { 1.0 } else { 0.0 }, 22.0);
+                ui.fill(r, 9.0, ink, 0.09 * wash);
+                ui.glyph(r[0] + 18.0, r[1] + r[3] / 2.0, 16.0, icon, if on { accent } else { ink }, if on { 1.0 } else { 0.28 });
+                ui.text_raw(r[0] + 32.0, r[1] + r[3] / 2.0 + 4.5, label, 12.5, false, ink, if on { 0.92 } else { 0.32 }, Align::Left);
+                if ui.click && hov {
+                    match i {
+                        0 => self.new_folder(),
+                        1 => self.fm.set_clip(self.selected_paths(), true),
+                        2 => self.fm.set_clip(self.selected_paths(), false),
+                        3 => self.paste(),
+                        4 => self.want_rename = true,
+                        _ => self.trash_selected(),
+                    }
+                    host.redraw = true;
+                }
+                x += r[2] + 4.0;
+            }
+        }
 
         // ---- status bar
         let mut status = self.status();
@@ -865,18 +918,58 @@ impl FilesApp {
                 go = Some(p.path.clone());
             }
         }
-        if let Some(p) = go {
+        // the mounted disks at the bottom of the sidebar, each with a bar of how full it is
+        if self.devices_at.elapsed().as_secs() >= 3 {
+            self.devices = fsops::mounts();
+            self.devices_at = std::time::Instant::now();
+            host.redraw = true;
+        }
+        const DEV_H: f32 = 46.0;
+        let floor = 56.0 + self.places.len() as f32 * 36.0 + 8.0;
+        let fit = (((h - 16.0 - 8.0 - 20.0 - floor) / DEV_H).floor().max(0.0) as usize).min(self.devices.len());
+        let mut dev_go = None;
+        if fit > 0 {
+            let top = h - 16.0 - 8.0 - fit as f32 * DEV_H;
+            ui.text(24.0, top - 6.0, "DEVICES", 10.5, false, ink, 0.45, Align::Left);
+            for (i, d) in self.devices.iter().take(fit).enumerate() {
+                let r = [16.0, top + i as f32 * DEV_H, SIDE_W - 32.0, DEV_H - 4.0];
+                let hov = ui.hit(r);
+                let wash = ui.ease(41_000 + i as u64, if hov { 1.0 } else { 0.0 }, 22.0);
+                let here = self.cwd == d.path;
+                ui.fill(r, 10.0, ink, if here { 0.09 } else { 0.07 * wash });
+                ui.glyph(r[0] + 18.0, r[1] + 14.0, 16.0, "hard-drive", accent, 1.0);
+                ui.text(r[0] + 40.0, r[1] + 18.8, &d.label, 13.0, here, ink, 0.95, Align::Left);
+                let used = if d.total > 0 { (1.0 - d.free as f32 / d.total as f32).clamp(0.0, 1.0) } else { 0.0 };
+                let bar = [r[0] + 12.0, r[1] + r[3] - 11.0, r[2] - 24.0, 5.0];
+                ui.fill(bar, 2.5, ink, 0.12);
+                if used > 0.0 {
+                    let col = if used > 0.9 { [0.92, 0.3, 0.27] } else { accent };
+                    ui.fill([bar[0], bar[1], (bar[2] * used).max(5.0), bar[3]], 2.5, col, 1.0);
+                }
+                if ui.click && hov {
+                    dev_go = Some(d.path.clone());
+                }
+            }
+        }
+        if let Some(p) = go.or(dev_go) {
             self.go(p);
         }
-
     }
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (chooser, start) = Chooser::from_args(&args);
-    let start = start.unwrap_or_else(fsops::home);
+    // a file given instead of a folder (a "Show in folder" from another program): its folder opens with it selected
+    let file = if chooser.is_none() { args.iter().filter(|a| !a.starts_with("--")).map(std::path::PathBuf::from).find(|p| p.is_file()) } else { None };
+    let start = start.or_else(|| file.as_ref().and_then(|f| f.parent().map(|d| d.to_path_buf()))).unwrap_or_else(fsops::home);
     let title = chooser.as_ref().map_or("Memrium Files".to_string(), |c| c.title.clone());
     let (w, h) = if chooser.is_some() { (880, 580) } else { (960, 620) };
-    app::run(Config::new(&title, "memrium-files").size(w, h).min_size(560, 360).decorations(Decorations::Client), FilesApp::new(start, chooser));
+    app::run(Config::new(&title, "memrium-files").size(w, h).min_size(560, 360).decorations(Decorations::Client), {
+        let mut app = FilesApp::new(start, chooser);
+        if let Some(f) = &file {
+            app.select_path(f);
+        }
+        app
+    });
 }
