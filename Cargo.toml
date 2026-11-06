@@ -14,3 +14,4 @@ path = "src/main.rs"
 chebrium = { git = "https://github.com/Supchik22/chebrium" }
 memrium-de = { git = "https://github.com/Supchik22/memrium" }
 serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff", "ico"] }
