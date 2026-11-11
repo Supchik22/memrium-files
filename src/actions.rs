@@ -17,6 +17,19 @@ pub const ZOOM_IN: u32 = 503;
 pub const ZOOM_OUT: u32 = 504;
 pub const CLOSE: u32 = 505;
 pub const OPEN_IN_NEW: u32 = 506;
+pub const NEW_TAB: u32 = 507;
+pub const OPEN_IN_TAB: u32 = 508;
+pub const CLOSE_TAB: u32 = 509;
+pub const QUICK_LOOK: u32 = 510;
+pub const INFO_PANEL: u32 = 511;
+pub const ADD_BOOKMARK: u32 = 512;
+pub const REMOVE_BOOKMARK: u32 = 513;
+pub const OPEN_WITH_OTHER: u32 = 514;
+pub const STYLE_DOLPHIN: u32 = 516;
+/// "Open With" a program: this plus the index in `FilesApp::open_with`
+pub const OPEN_WITH_BASE: u32 = 800;
+/// the bookmarks in the Go menu
+pub const BOOKMARK_BASE: u32 = 900;
 
 /// The shell's menu entry as one of the toolkit's.
 pub fn item_of(m: &MenuItem) -> Item {
@@ -57,10 +70,13 @@ fn view_items(a: &FilesApp) -> Vec<Item> {
         ),
         Item::new(cmd::HIDDEN, "Show hidden files").key("Ctrl+H").checked(p.show_hidden),
         Item::sep(),
-        Item::new(ZOOM_IN, "Zoom In").key("Ctrl++").enabled(p.view == ViewMode::Icons),
-        Item::new(ZOOM_OUT, "Zoom Out").key("Ctrl+-").enabled(p.view == ViewMode::Icons),
+        Item::new(ZOOM_IN, "Zoom In").key("Ctrl++"),
+        Item::new(ZOOM_OUT, "Zoom Out").key("Ctrl+-"),
         Item::sep(),
-        Item::new(FIND, "Filter…").key("Ctrl+F"),
+        Item::new(QUICK_LOOK, "Quick Look").key("Space"),
+        Item::new(INFO_PANEL, "Information Panel").key("F11").checked(p.info_panel),
+        Item::sep(),
+        Item::new(FIND, "Search…").key("Ctrl+F"),
         Item::new(cmd::REFRESH, "Refresh").key("F5"),
     ]
 }
@@ -70,6 +86,7 @@ fn settings_items(a: &FilesApp) -> Vec<Item> {
     let p = &a.prefs;
     vec![
         Item::parent("Preset", PRESETS.iter().enumerate().map(|(i, n)| Item::new(cmd::PRESET_BASE + i as u32, *n).checked(p.preset == *n)).collect()),
+        Item::new(STYLE_DOLPHIN, "Dolphin layout").checked(p.style == memrium_de::files::FilesStyle::Dolphin),
         Item::sep(),
         Item::parent("Icon size", vec![Item::new(cmd::ICON_SMALL, "Small").checked(p.icon_size < 56.0), Item::new(cmd::ICON_MEDIUM, "Medium").checked((56.0..80.0).contains(&p.icon_size)), Item::new(cmd::ICON_LARGE, "Large").checked(p.icon_size >= 80.0)]),
         Item::parent("Columns", vec![Item::new(cmd::COL_KIND, "Type").checked(p.col_kind), Item::new(cmd::COL_SIZE, "Size").checked(p.col_size), Item::new(cmd::COL_DATE, "Date modified").checked(p.col_date)]),
@@ -92,6 +109,7 @@ pub fn bar_menus(a: &FilesApp) -> Vec<Menu> {
     let go_place = |ps: &[Place], base: u32| -> Vec<Item> { ps.iter().enumerate().map(|(i, p)| mi(base + i as u32, p.name, p.icon)).collect() };
     let mut go = vec![mi(cmd::G_BACK, "Back", "arrow-left").key("Alt+←").enabled(a.can_back()), mi(cmd::G_FWD, "Forward", "arrow-right").key("Alt+→").enabled(a.can_forward()), mi(cmd::G_UP, "Enclosing Folder", "arrow-up").key("Alt+↑").enabled(a.can_up()), Item::sep()];
     go.extend(go_place(&a.places, 600));
+    go.extend(a.bookmarks.iter().enumerate().map(|(i, b)| Item::new(BOOKMARK_BASE + i as u32, b.label.clone()).icon("bookmark")));
     go.push(Item::sep());
     go.extend(go_place(&a.system, 700));
     go.push(Item::sep());
@@ -102,15 +120,17 @@ pub fn bar_menus(a: &FilesApp) -> Vec<Menu> {
             "File",
             vec![
                 mi(NEW_WINDOW, "New Window", "folder").key("Ctrl+N"),
-                mi(cmd::NEW_FOLDER, "New Folder", "folder-plus").key("Ctrl+Shift+N").enabled(!a.computer()),
-                mi(cmd::NEW_FILE, "New Text File", "file-plus").enabled(!a.computer()),
+                mi(NEW_TAB, "New Tab", "plus").key("Ctrl+T"),
+                mi(cmd::NEW_FOLDER, "New Folder", "folder-plus").key("Ctrl+Shift+N").enabled(!a.pseudo()),
+                mi(cmd::NEW_FILE, "New Text File", "file-plus").enabled(!a.pseudo()),
                 Item::sep(),
                 Item::new(cmd::OPEN, "Open").key("Enter").enabled(one),
                 Item::new(cmd::RENAME, "Rename").key("F2").enabled(one),
                 Item::new(cmd::TRASH, "Move to Trash").key("Delete").enabled(some && !a.in_trash()),
                 Item::new(cmd::PROPERTIES, "Properties").key("Ctrl+I").enabled(one),
                 Item::sep(),
-                Item::new(CLOSE, "Close Window").key("Ctrl+W"),
+                Item::new(CLOSE_TAB, "Close Tab").key("Ctrl+W").enabled(a.tabs.len() > 1),
+                Item::new(CLOSE, "Close Window").key("Ctrl+Q"),
             ],
         ),
         Menu::new(
@@ -120,7 +140,7 @@ pub fn bar_menus(a: &FilesApp) -> Vec<Menu> {
                 Item::sep(),
                 Item::new(cmd::CUT, "Cut").key("Ctrl+X").enabled(some),
                 Item::new(cmd::COPY, "Copy").key("Ctrl+C").enabled(some),
-                Item::new(cmd::PASTE, "Paste").key("Ctrl+V").enabled(!a.computer() && a.fm.can_paste()),
+                Item::new(cmd::PASTE, "Paste").key("Ctrl+V").enabled(!a.pseudo() && a.fm.can_paste()),
                 Item::new(cmd::COPY_PATH, "Copy Path").enabled(one),
                 Item::sep(),
                 Item::new(cmd::SELECT_ALL, "Select All").key("Ctrl+A"),
@@ -143,6 +163,7 @@ impl FilesApp {
             if !self.sel.contains(&path) {
                 self.select_only(i);
             }
+            self.prepare_open_with();
             self.entry_menu()
         } else if chebrium::ui::inside(at, self.list_rect) {
             self.sel.clear();
@@ -161,7 +182,11 @@ impl FilesApp {
     }
 
     fn place_menu(&self, path: PathBuf) -> Vec<Item> {
-        let mut v = vec![mi(OPEN_IN_NEW, "Open in New Window", "folder")];
+        let mut v = vec![mi(OPEN_IN_TAB, "Open in New Tab", "plus"), mi(OPEN_IN_NEW, "Open in New Window", "folder")];
+        if self.bookmarks.iter().any(|b| b.path == path) {
+            v.push(Item::sep());
+            v.push(mi(REMOVE_BOOKMARK, "Remove from Places", "bookmark"));
+        }
         if path == fsops::trash_path() {
             v.push(Item::sep());
             v.push(mi(cmd::EMPTY_TRASH, "Empty Trash", "trash-2").danger());
@@ -170,12 +195,12 @@ impl FilesApp {
     }
 
     fn background_menu(&self) -> Vec<Item> {
-        let c = self.computer();
+        let c = self.pseudo();
         let mut v = Vec::new();
-        if c {
+        if self.computer() {
             v.push(mi(cmd::CONNECT_SERVER, "Connect to Server…", "server"));
             v.push(Item::sep());
-        } else {
+        } else if !c {
             v.push(Item::parent("Create New", vec![mi(cmd::NEW_FOLDER, "Folder", "folder-plus").key("Ctrl+Shift+N"), mi(cmd::NEW_FILE, "Text file", "file-text")]).icon("file-plus"));
             v.push(mi(cmd::PASTE, "Paste", "clipboard-paste").key("Ctrl+V").enabled(self.fm.can_paste()));
             v.push(mi(cmd::UNDO, "Undo", "undo-2").key("Ctrl+Z").enabled(self.fm.can_undo()));
@@ -191,9 +216,50 @@ impl FilesApp {
         v.push(Item::parent("Settings", settings_items(self)).icon("settings"));
         if !c {
             v.push(Item::sep());
+            v.push(mi(ADD_BOOKMARK, "Add to Places", "bookmark"));
             v.push(mi(cmd::TERMINAL, "Open Terminal here", "terminal"));
         }
         v
+    }
+
+    /// The programs that open the selected files (all of one type, or the first file's), for the Open With menu.
+    fn prepare_open_with(&mut self) {
+        let sel = self.selected_entries();
+        self.open_with = match sel.first() {
+            Some(e) if !e.is_dir => {
+                let mime = memrium_de::mimeapps::mime_of(&e.path);
+                memrium_de::mimeapps::handlers_for(&mime).into_iter().take(8).collect()
+            }
+            _ => Vec::new(),
+        };
+    }
+
+    /// Open the Open With picker for the selected files.
+    pub fn open_picker(&mut self) {
+        let files: Vec<PathBuf> = self.selected_entries().iter().filter(|e| !e.is_dir).map(|e| e.path.clone()).collect();
+        let Some(first) = files.first() else { return };
+        let mime = memrium_de::mimeapps::mime_of(first);
+        let list = memrium_de::mimeapps::handlers_for(&mime);
+        let all = list.is_empty();
+        let mut p = crate::Picker { files, mime, list, chosen: 0, always: false, all, scroll: 0.0 };
+        if all {
+            p.list = all_programs();
+        }
+        self.picker = Some(p);
+    }
+
+    /// The picker's choice: start the program, and make it the default when asked.
+    pub fn picker_open(&mut self) {
+        let Some(p) = self.picker.take() else { return };
+        let Some(h) = p.list.get(p.chosen) else { return };
+        if p.always {
+            if let Err(e) = memrium_de::mimeapps::set_default(&p.mime, &h.id) {
+                self.fm.note = chebrium::i18n::trf("Could not save the choice: {}", &[e.to_string()]);
+            }
+        }
+        if let Err(e) = memrium_de::mimeapps::open_with(h, &p.files, &crate::socket()) {
+            self.fm.note = chebrium::i18n::trf("{} did not start: {}", &[h.name.clone(), e.to_string()]);
+        }
     }
 
     fn entry_menu(&self) -> Vec<Item> {
@@ -201,7 +267,20 @@ impl FilesApp {
         let one = sel.len() == 1;
         let in_trash = self.in_trash();
         let paths: Vec<PathBuf> = sel.iter().map(|e| e.path.clone()).collect();
-        let mut v = vec![mi(cmd::OPEN, "Open", "external-link").key("Enter").enabled(one), Item::sep()];
+        let mut v = vec![mi(cmd::OPEN, "Open", "external-link").key("Enter").enabled(one)];
+        if one && sel[0].is_dir && !self.pseudo_entry() {
+            v.push(mi(OPEN_IN_TAB, "Open in New Tab", "plus"));
+        }
+        if sel.iter().any(|e| !e.is_dir) {
+            let mut sub: Vec<Item> = self.open_with.iter().enumerate().map(|(i, h)| Item::new(OPEN_WITH_BASE + i as u32, h.name.clone())).collect();
+            if !sub.is_empty() {
+                sub.push(Item::sep());
+            }
+            sub.push(Item::new(OPEN_WITH_OTHER, "Other Application…"));
+            v.push(Item::parent("Open With", sub).icon("app-window"));
+        }
+        v.push(mi(QUICK_LOOK, "Quick Look", "eye").key("Space").enabled(one));
+        v.push(Item::sep());
         v.push(mi(cmd::CUT, "Cut", "scissors").key("Ctrl+X"));
         v.push(mi(cmd::COPY, "Copy", "copy").key("Ctrl+C"));
         v.push(mi(cmd::PASTE, "Paste", "clipboard-paste").key("Ctrl+V").enabled(self.fm.can_paste() && one && sel[0].is_dir));
@@ -226,9 +305,20 @@ impl FilesApp {
             v.push(mi(cmd::COMPRESS, "Compress…", "file-archive"));
         }
         v.push(Item::sep());
+        if self.mixed() && one {
+            v.push(mi(cmd::G_UP, "Show in Folder", "folder-open"));
+        }
+        if one && sel[0].is_dir && !self.bookmarks.iter().any(|b| b.path == sel[0].path) {
+            v.push(mi(ADD_BOOKMARK, "Add to Places", "bookmark"));
+        }
         v.push(Item::new(cmd::COPY_PATH, "Copy path").enabled(one));
         v.push(mi(cmd::PROPERTIES, "Properties", "info").key("Ctrl+I").enabled(one));
         v
+    }
+
+    /// The menu was opened over the Computer view (its entries are disks, not files of a folder).
+    fn pseudo_entry(&self) -> bool {
+        self.computer()
     }
 
     fn selected_paths(&self) -> Vec<PathBuf> {
@@ -252,16 +342,13 @@ impl FilesApp {
                 }
             }
             cmd::CUT | cmd::COPY if !paths.is_empty() => self.fm.set_clip(paths, id == cmd::CUT),
-            cmd::PASTE if !self.computer() => {
+            cmd::PASTE if !self.pseudo() => {
                 let dir = match self.selected_entries().as_slice() {
                     [e] if e.is_dir => e.path.clone(),
                     _ => self.cwd.clone(),
                 };
-                let made = self.fm.paste_into(&dir);
-                self.changed();
-                if dir == self.cwd && !made.is_empty() {
-                    self.sel = made;
-                }
+                let (files, cut) = self.fm.take_paste();
+                self.start_job(if cut { crate::jobs::Op::Move } else { crate::jobs::Op::Copy }, files, dir);
             }
             cmd::RENAME if one.is_some() => self.want_rename = true,
             cmd::TRASH if !paths.is_empty() => {
@@ -283,7 +370,7 @@ impl FilesApp {
                 fsops::empty_trash();
                 self.fm.gen += 1;
             }
-            cmd::NEW_FOLDER | cmd::NEW_FILE if !self.computer() => {
+            cmd::NEW_FOLDER | cmd::NEW_FILE if !self.pseudo() && !self.searching() => {
                 let dir = self.cwd.clone();
                 let made = if id == cmd::NEW_FOLDER { self.fm.new_folder(&dir) } else { self.fm.new_file(&dir) };
                 if let Some(p) = made {
@@ -343,7 +430,61 @@ impl FilesApp {
             cmd::PROPERTIES => self.props = one.and_then(|p| self.entry_of(&p)),
             cmd::G_BACK => self.go_back(),
             cmd::G_FWD => self.go_forward(),
+            cmd::G_UP if self.mixed() => {
+                // a search result or a recent file: its own folder, with it selected
+                if let Some(p) = one {
+                    if let Some(dir) = p.parent() {
+                        self.go(dir.to_path_buf());
+                        self.select_path(&p);
+                    }
+                } else {
+                    self.go_up();
+                }
+            }
             cmd::G_UP => self.go_up(),
+            NEW_TAB => self.new_tab(self.cwd.clone()),
+            CLOSE_TAB => self.close_tab(self.tab, host),
+            OPEN_IN_TAB => {
+                let p = self.menu_place.take().or_else(|| one.clone().filter(|p| p.is_dir())).unwrap_or_else(|| self.cwd.clone());
+                self.new_tab(p);
+            }
+            QUICK_LOOK => self.toggle_quick(),
+            INFO_PANEL => self.prefs.info_panel = !self.prefs.info_panel,
+            STYLE_DOLPHIN => {
+                use memrium_de::files::FilesStyle;
+                self.prefs.style = if self.prefs.style == FilesStyle::Dolphin { FilesStyle::Glass } else { FilesStyle::Dolphin };
+            }
+            ADD_BOOKMARK => {
+                let dir = one.clone().filter(|p| p.is_dir()).unwrap_or_else(|| self.cwd.clone());
+                if let Err(e) = crate::places::add_bookmark(&dir) {
+                    self.fm.note = chebrium::i18n::trf("Could not add the bookmark: {}", &[e.to_string()]);
+                }
+                self.bookmarks = crate::places::bookmarks();
+                prefs = false;
+            }
+            REMOVE_BOOKMARK => {
+                if let Some(p) = self.menu_place.take() {
+                    let _ = crate::places::remove_bookmark(&p);
+                }
+                self.bookmarks = crate::places::bookmarks();
+                prefs = false;
+            }
+            OPEN_WITH_OTHER => {
+                self.open_picker();
+                prefs = false;
+            }
+            n if (OPEN_WITH_BASE..OPEN_WITH_BASE + self.open_with.len() as u32).contains(&n) => {
+                let h = self.open_with[(n - OPEN_WITH_BASE) as usize].clone();
+                let files: Vec<PathBuf> = paths.iter().filter(|p| !p.is_dir()).cloned().collect();
+                if let Err(e) = memrium_de::mimeapps::open_with(&h, &files, &crate::socket()) {
+                    self.fm.note = chebrium::i18n::trf("{} did not start: {}", &[h.name.clone(), e.to_string()]);
+                }
+                prefs = false;
+            }
+            n if (BOOKMARK_BASE..BOOKMARK_BASE + self.bookmarks.len() as u32).contains(&n) => {
+                self.go(self.bookmarks[(n - BOOKMARK_BASE) as usize].path.clone());
+                prefs = false;
+            }
             NEW_WINDOW => self.own("memrium_files", vec![self.cwd.to_string_lossy().to_string()]),
             OPEN_IN_NEW => {
                 let p = self.menu_place.take().unwrap_or_else(|| self.cwd.clone());
@@ -353,10 +494,17 @@ impl FilesApp {
             FIND => {
                 self.filter_open = true;
                 self.want_filter = true;
+                prefs = false;
             }
             LOCATION => self.want_location = Some(self.cwd.to_string_lossy().to_string()),
-            ZOOM_IN => self.prefs.icon_size = (self.prefs.icon_size + 8.0).min(128.0),
-            ZOOM_OUT => self.prefs.icon_size = (self.prefs.icon_size - 8.0).max(40.0),
+            ZOOM_IN | ZOOM_OUT => {
+                let d = if id == ZOOM_IN { 1.0 } else { -1.0 };
+                if self.prefs.view == ViewMode::Icons {
+                    self.prefs.icon_size = (self.prefs.icon_size + 8.0 * d).clamp(40.0, 128.0);
+                } else {
+                    self.prefs.row_h = (self.prefs.row_h + 2.0 * d).clamp(24.0, 44.0);
+                }
+            }
             n if (600..600 + self.places.len() as u32).contains(&n) => {
                 self.go(self.places[(n - 600) as usize].path.clone());
                 prefs = false;
@@ -454,4 +602,26 @@ impl FilesApp {
         }
         self.reload();
     }
+}
+
+/// Every program, for "show all programs" in the Open With picker (the ones without a file type take the files at the
+/// end of their command line).
+pub fn all_programs() -> Vec<memrium_de::mimeapps::Handler> {
+    let mut v: Vec<memrium_de::mimeapps::Handler> = memrium_de::apps::scan()
+        .into_iter()
+        .filter(|a| !a.exec.is_empty())
+        .map(|a| memrium_de::mimeapps::Handler { id: a.id, name: a.name, icon: a.icon, exec: a.exec, terminal: a.terminal, mimes: Vec::new(), hidden: false })
+        .collect();
+    v.sort_by_key(|h| h.name.to_lowercase());
+    v
+}
+
+/// The View entries, for the Dolphin look's ≡ menu.
+pub fn view_menu(a: &FilesApp) -> Vec<Item> {
+    view_items(a)
+}
+
+/// The Settings entries, for the Dolphin look's ≡ menu.
+pub fn settings_menu(a: &FilesApp) -> Vec<Item> {
+    settings_items(a)
 }

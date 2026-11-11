@@ -188,6 +188,24 @@ impl Icons {
         icon
     }
 
+    /// A program's icon by the name its desktop file gives (Open With).
+    pub fn app(&mut self, name: &str) -> Option<Icon> {
+        if name.is_empty() {
+            return None;
+        }
+        // an icon given as a file
+        if name.starts_with('/') {
+            let key = format!("appf:{name}");
+            if let Some(i) = self.made.get(&key) {
+                return i.clone();
+            }
+            let i = memrium_de::apps::load_icon_file(std::path::Path::new(name), PX).map(Icon::new);
+            self.made.insert(key, i.clone());
+            return i;
+        }
+        self.named(format!("app:{name}"), &[name], true)
+    }
+
     /// The theme's icon for the kind of `e` (or the icon its launcher declares).
     pub fn kind(&mut self, e: &Entry) -> Option<Icon> {
         if let Some((_, icon)) = e.app.as_ref().filter(|(_, i)| !i.is_empty()) {

@@ -11,7 +11,12 @@
 
 mod actions;
 mod chooser;
+mod dolphin;
 mod icons;
+mod jobs;
+mod places;
+mod quicklook;
+mod search;
 mod view;
 mod watch;
 
@@ -34,7 +39,7 @@ pub(crate) struct Place {
 }
 
 /// The places of the sidebar: the home folders, then the system ones.
-fn places() -> (Vec<Place>, Vec<Place>) {
+fn places_list() -> (Vec<Place>, Vec<Place>) {
     let home = fsops::home();
     let mut user = vec![Place { name: "Home", icon: "house", path: home.clone() }];
     for (name, icon, dir) in [("Desktop", "monitor", "Desktop"), ("Documents", "file-text", "Documents"), ("Downloads", "download", "Downloads"), ("Pictures", "image", "Pictures"), ("Music", "music", "Music"), ("Videos", "video", "Videos")] {
@@ -43,7 +48,7 @@ fn places() -> (Vec<Place>, Vec<Place>) {
             user.push(Place { name, icon, path });
         }
     }
-    let system = vec![Place { name: "Computer", icon: "laptop", path: PathBuf::from(fsops::COMPUTER) }, Place { name: "Root", icon: "hard-drive", path: PathBuf::from("/") }, Place { name: "Trash", icon: "trash-2", path: fsops::trash_path() }];
+    let system = vec![Place { name: "Recent Files", icon: "clock", path: PathBuf::from(places::RECENT) }, Place { name: "Computer", icon: "laptop", path: PathBuf::from(fsops::COMPUTER) }, Place { name: "Root", icon: "hard-drive", path: PathBuf::from("/") }, Place { name: "Trash", icon: "trash-2", path: fsops::trash_path() }];
     (user, system)
 }
 
@@ -51,6 +56,29 @@ fn places() -> (Vec<Place>, Vec<Place>) {
 struct Press {
     at: [f32; 2],
     paths: Vec<PathBuf>,
+}
+
+/// A tab: where it is and what it had selected, kept while another tab is shown (the shown one lives in the app's own
+/// fields).
+#[derive(Clone)]
+pub(crate) struct Tab {
+    pub cwd: PathBuf,
+    back: Vec<PathBuf>,
+    forward: Vec<PathBuf>,
+    sel: Vec<PathBuf>,
+    scroll: f32,
+    filter: String,
+}
+
+/// The Open With picker: the file(s), the programs offered, which one is picked, and whether it becomes the default.
+pub(crate) struct Picker {
+    pub files: Vec<PathBuf>,
+    pub mime: String,
+    pub list: Vec<memrium_de::mimeapps::Handler>,
+    pub chosen: usize,
+    pub always: bool,
+    pub all: bool,
+    pub scroll: f32,
 }
 
 pub(crate) struct FilesApp {
@@ -122,11 +150,36 @@ pub(crate) struct FilesApp {
     pub last_pointer: [f32; 2],
     /// the place a sidebar menu was opened for
     menu_place: Option<PathBuf>,
+    /// copies and moves going on, and the question one of them asks (with "for all the rest")
+    pub jobs: Vec<jobs::Job>,
+    pub ask: Option<jobs::Ask>,
+    pub ask_all: bool,
+    /// a rubber band being drawn: where it started (x, content y), and the selection it adds to
+    pub band: Option<[f32; 2]>,
+    pub band_base: Vec<PathBuf>,
+    /// the programs of the last Open With menu (its entries are indices into this)
+    pub open_with: Vec<memrium_de::mimeapps::Handler>,
+    pub picker: Option<Picker>,
+    pub bookmarks: Vec<places::Bookmark>,
+    /// a search from the folder down (the filter field with a query in it)
+    pub search: Option<search::Search>,
+    /// the tabs (the shown one is `tab`; its slot is stale while it is shown)
+    pub tabs: Vec<Tab>,
+    pub tab: usize,
+    pub tab_rects: Vec<(usize, [f32; 4])>,
+    /// Quick Look is open on the cursor's entry
+    pub quick: bool,
+    pub quick_scroll: f32,
+    pub previews: quicklook::Previews,
+    /// (free, total) of the folder's disk, for the status bar
+    pub space: Option<(u64, u64)>,
+    /// the sidebar's rectangle as last drawn (a folder dropped on its free part becomes a bookmark)
+    pub side_rect: [f32; 4],
 }
 
 impl FilesApp {
     fn new(start: PathBuf, chooser: Option<Chooser>) -> FilesApp {
-        let (places, system) = places();
+        let (places, system) = places_list();
         let mut app = FilesApp {
             prefs: FilesPrefs::load(),
             cwd: start,
@@ -174,18 +227,48 @@ impl FilesApp {
             side_hl_init: false,
             last_pointer: [200.0, 120.0],
             menu_place: None,
+            jobs: Vec::new(),
+            ask: None,
+            ask_all: false,
+            band: None,
+            band_base: Vec::new(),
+            open_with: Vec::new(),
+            picker: None,
+            bookmarks: places::bookmarks(),
+            search: None,
+            tabs: Vec::new(),
+            tab: 0,
+            tab_rects: Vec::new(),
+            quick: false,
+            quick_scroll: 0.0,
+            previews: Default::default(),
+            space: None,
+            side_rect: [0.0; 4],
         };
-        app.cwd = app.cwd.canonicalize().unwrap_or(app.cwd.clone());
+        if !pseudo_path(&app.cwd) {
+            app.cwd = app.cwd.canonicalize().unwrap_or(app.cwd.clone());
+        }
         app.reload();
+        app.tabs.push(app.snapshot());
         app
     }
 
     // ---------------------------------------------------------------- the folder
 
     pub fn reload(&mut self) {
+        self.space = (!self.pseudo()).then(|| places::disk_space(&self.cwd)).flatten();
+        // a search from here: its results come in from its thread
+        if self.searching() {
+            self.error.clear();
+            self.restart_search();
+            return;
+        }
         self.entries = if fsops::is_computer(&self.cwd) {
             self.error.clear();
             fsops::drives()
+        } else if places::is_recent(&self.cwd) {
+            self.error.clear();
+            places::recent_entries()
         } else {
             let p = &self.prefs;
             match fsops::list_dir(&self.cwd, p.show_hidden, p.sort, p.sort_desc, p.dirs_first) {
@@ -205,13 +288,72 @@ impl FilesApp {
         let entries = &self.entries;
         self.sel.retain(|p| entries.iter().any(|e| &e.path == p));
         self.apply_filter();
-        self.watch.follow((!fsops::is_computer(&self.cwd)).then(|| self.cwd.clone()));
+        self.watch.follow((!self.pseudo()).then(|| self.cwd.clone()));
     }
 
     pub fn apply_filter(&mut self) {
-        let f = self.filter.to_lowercase();
-        self.shown = (0..self.entries.len()).filter(|&i| f.is_empty() || self.entries[i].title().to_lowercase().contains(&f) || self.entries[i].name.to_lowercase().contains(&f)).collect();
+        let w = search::words(&self.filter);
+        self.shown = (0..self.entries.len()).filter(|&i| w.is_empty() || search::matches(self.entries[i].title(), &w) || search::matches(&self.entries[i].name, &w)).collect();
         self.cursor = self.cursor.filter(|&i| i < self.shown.len());
+    }
+
+    /// The list is the results of a search from the folder down (a query typed in a real folder).
+    pub fn searching(&self) -> bool {
+        !self.filter.trim().is_empty() && !self.pseudo() && self.chooser.is_none()
+    }
+
+    /// The list holds entries of many folders (search results, Recent): the details show where each is.
+    pub fn mixed(&self) -> bool {
+        self.searching() || places::is_recent(&self.cwd)
+    }
+
+    fn restart_search(&mut self) {
+        self.search = Some(search::Search::start(self.cwd.clone(), self.filter.clone(), self.prefs.show_hidden, self.waker.clone()));
+        self.entries.clear();
+        self.shown.clear();
+        self.cursor = None;
+        self.watch.follow(None);
+    }
+
+    /// The query of the filter field changed: search from here (or narrow the list of a place that is not a folder).
+    pub fn set_query(&mut self, q: String) {
+        let was = self.searching();
+        self.filter = q;
+        self.scroll = 0.0;
+        if self.searching() {
+            self.restart_search();
+        } else {
+            self.search = None;
+            if was {
+                self.reload();
+            } else {
+                self.apply_filter();
+            }
+        }
+    }
+
+    /// Results of the search that came in since the last frame.
+    fn take_search(&mut self) -> bool {
+        let Some(s) = self.search.as_mut() else { return false };
+        let new = s.take_new();
+        if new.is_empty() {
+            return false;
+        }
+        let w = search::words(&self.filter);
+        for e in new {
+            if self.chooser.as_ref().is_none_or(|c| c.shows(&e)) {
+                if search::matches(&e.name, &w) || search::matches(e.title(), &w) {
+                    self.shown.push(self.entries.len());
+                }
+                self.entries.push(e);
+            }
+        }
+        true
+    }
+
+    /// The place shown is not a folder of the disk (Computer, Recent).
+    pub fn pseudo(&self) -> bool {
+        pseudo_path(&self.cwd)
     }
 
     /// The entry shown at position `i`.
@@ -235,10 +377,14 @@ impl FilesApp {
         fsops::is_computer(&self.cwd)
     }
 
+    pub fn recent(&self) -> bool {
+        places::is_recent(&self.cwd)
+    }
+
     // ---------------------------------------------------------------- moving around
 
     pub fn go(&mut self, path: PathBuf) {
-        let path = if fsops::is_computer(&path) { path } else { path.canonicalize().unwrap_or(path) };
+        let path = if pseudo_path(&path) { path } else { path.canonicalize().unwrap_or(path) };
         if path == self.cwd {
             return;
         }
@@ -258,9 +404,12 @@ impl FilesApp {
         self.renaming = None;
         self.filter.clear();
         self.filter_open = false;
+        self.search = None;
         self.locating = false;
         self.fm.note.clear();
         self.props = None;
+        self.quick = false;
+        self.band = None;
         if let Some(c) = &mut self.chooser {
             c.replace = false;
         }
@@ -290,7 +439,7 @@ impl FilesApp {
     }
 
     pub fn can_up(&self) -> bool {
-        !self.computer() && self.cwd.parent().is_some()
+        !self.pseudo() && self.cwd.parent().is_some()
     }
 
     pub fn go_up(&mut self) {
@@ -451,7 +600,11 @@ impl FilesApp {
     /// Where files dropped at `p` go: a place of the sidebar, a folder under it, or the folder shown.
     pub fn drop_target(&self, p: [f32; 2]) -> Option<PathBuf> {
         if let Some((path, _)) = self.place_rects.iter().find(|(_, r)| chebrium::ui::inside(p, *r)) {
-            return (!fsops::is_computer(path)).then(|| path.clone());
+            return (!pseudo_path(path)).then(|| path.clone());
+        }
+        if let Some((i, _)) = self.tab_rects.iter().find(|(_, r)| chebrium::ui::inside(p, *r)) {
+            let dir = if *i == self.tab { self.cwd.clone() } else { self.tabs[*i].cwd.clone() };
+            return (!pseudo_path(&dir)).then_some(dir);
         }
         if let Some(i) = self.entry_at(p) {
             let e = self.at(i);
@@ -459,7 +612,7 @@ impl FilesApp {
                 return Some(e.path.clone());
             }
         }
-        (!self.computer()).then(|| self.cwd.clone())
+        (!self.pseudo() && !self.searching()).then(|| self.cwd.clone())
     }
 
     // ---------------------------------------------------------------- opening
@@ -479,7 +632,7 @@ impl FilesApp {
     /// Whether the dialog's main button can be pressed.
     pub fn can_accept(&self) -> bool {
         let Some(c) = &self.chooser else { return false };
-        let computer = self.computer();
+        let computer = self.pseudo();
         match c.mode {
             Mode::Open => self.selected_entries().iter().any(|e| !e.is_dir),
             Mode::Dir => !computer || !self.sel.is_empty(),
@@ -551,21 +704,158 @@ impl FilesApp {
     /// Files dropped on the window at `at`: moved there when they are on the same disk, else copied (Ctrl copies always).
     fn drop_files(&mut self, files: Vec<PathBuf>, at: Option<[f32; 2]>, copy: bool) {
         use std::os::unix::fs::MetadataExt;
-        let Some(dir) = at.and_then(|p| self.drop_target(p)).or_else(|| (!self.computer()).then(|| self.cwd.clone())) else { return };
+        // folders dropped on the free part of the sidebar become bookmarks
+        if let Some(p) = at.filter(|p| chebrium::ui::inside(*p, self.side_rect) && !self.place_rects.iter().any(|(_, r)| chebrium::ui::inside(*p, *r))) {
+            let _ = p;
+            let dirs: Vec<&PathBuf> = files.iter().filter(|f| f.is_dir()).collect();
+            for d in &dirs {
+                if let Err(e) = places::add_bookmark(d) {
+                    self.fm.note = chebrium::i18n::trf("Could not add the bookmark: {}", &[e.to_string()]);
+                }
+            }
+            self.bookmarks = places::bookmarks();
+            return;
+        }
+        let Some(dir) = at.and_then(|p| self.drop_target(p)).or_else(|| (!self.pseudo() && !self.searching()).then(|| self.cwd.clone())) else { return };
         if dir.starts_with(fsops::trash_path()) {
             // into the Trash means "throw away"
             self.fm.trash_all(&files);
             return self.changed();
         }
+        // files of the same disk move, from another disk they are copied (Ctrl copies always)
         let dev = |p: &Path| std::fs::metadata(p).map(|m| m.dev()).ok();
         let here = dev(&dir);
-        let (same, other): (Vec<PathBuf>, Vec<PathBuf>) = files.into_iter().partition(|f| !copy && dev(f) == here && here.is_some());
-        let n = self.fm.drop_into(&same, &dir, false) + self.fm.drop_into(&other, &dir, true);
-        if n > 0 {
-            let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "/".into());
-            self.fm.note = chebrium::i18n::trf("{} item(s) put in {}", &[n.to_string(), name]);
+        let (same, other): (Vec<PathBuf>, Vec<PathBuf>) = files.into_iter().filter(|f| *f != dir).partition(|f| !copy && dev(f) == here && here.is_some());
+        if !same.is_empty() {
+            self.start_job(jobs::Op::Move, same, dir.clone());
         }
-        self.changed();
+        if !other.is_empty() {
+            self.start_job(jobs::Op::Copy, other, dir);
+        }
+    }
+
+    /// Copy or move on a thread (the progress card shows it; the window goes on).
+    pub fn start_job(&mut self, op: jobs::Op, files: Vec<PathBuf>, dir: PathBuf) {
+        if files.is_empty() {
+            return;
+        }
+        self.jobs.push(jobs::Job::start(op, files, dir, self.waker.clone()));
+    }
+
+    /// Look after the jobs: a question to ask, the ones that are over (their changes go to Undo, the new files are
+    /// selected when they are here).
+    fn poll_jobs(&mut self) -> bool {
+        let mut any = false;
+        if self.ask.is_none() {
+            if let Some(a) = self.jobs.iter().find_map(|j| j.take_ask()) {
+                self.ask = Some(a);
+                self.ask_all = false;
+                any = true;
+            }
+        }
+        let mut i = 0;
+        while i < self.jobs.len() {
+            let Some(out) = self.jobs[i].take_outcome() else {
+                i += 1;
+                continue;
+            };
+            let job = self.jobs.remove(i);
+            any = true;
+            let n = out.made.len();
+            self.fm.record(out.undo);
+            let name = job.dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "/".into());
+            self.fm.note = if let Some(e) = out.errors.first() {
+                chebrium::i18n::trf("Could not finish: {}", &[e.clone()])
+            } else if out.cancelled {
+                chebrium::i18n::tr("Stopped").into_owned()
+            } else if job.op == jobs::Op::Move {
+                chebrium::i18n::trf("{} item(s) moved to {}", &[n.to_string(), name])
+            } else {
+                chebrium::i18n::trf("{} item(s) copied to {}", &[n.to_string(), name])
+            };
+            self.changed();
+            if job.dir == self.cwd && n > 0 {
+                self.sel = out.made;
+            }
+        }
+        any
+    }
+
+    // ---------------------------------------------------------------- tabs
+
+    fn snapshot(&self) -> Tab {
+        Tab { cwd: self.cwd.clone(), back: self.back.clone(), forward: self.forward.clone(), sel: self.sel.clone(), scroll: self.scroll, filter: self.filter.clone() }
+    }
+
+    fn restore(&mut self, t: Tab) {
+        self.cwd = t.cwd;
+        self.back = t.back;
+        self.forward = t.forward;
+        self.arrived();
+        self.sel = t.sel;
+        self.scroll = t.scroll;
+        if !t.filter.is_empty() {
+            self.filter_open = true;
+            self.set_query(t.filter);
+        }
+    }
+
+    /// A new tab on `dir` after the shown one, shown at once.
+    pub fn new_tab(&mut self, dir: PathBuf) {
+        self.tabs[self.tab] = self.snapshot();
+        let dir = if pseudo_path(&dir) { dir } else { dir.canonicalize().unwrap_or(dir) };
+        let t = Tab { cwd: dir, back: Vec::new(), forward: Vec::new(), sel: Vec::new(), scroll: 0.0, filter: String::new() };
+        self.tabs.insert(self.tab + 1, t.clone());
+        self.tab += 1;
+        self.restore(t);
+    }
+
+    pub fn switch_tab(&mut self, i: usize) {
+        if i == self.tab || i >= self.tabs.len() {
+            return;
+        }
+        self.tabs[self.tab] = self.snapshot();
+        self.tab = i;
+        let t = self.tabs[i].clone();
+        self.restore(t);
+    }
+
+    /// Close tab `i`; the last one closes the window.
+    pub fn close_tab(&mut self, i: usize, host: &mut Host) {
+        if self.tabs.len() <= 1 {
+            host.quit = true;
+            return;
+        }
+        if i == self.tab {
+            self.tabs.remove(i);
+            self.tab = i.min(self.tabs.len() - 1);
+            let t = self.tabs[self.tab].clone();
+            self.restore(t);
+        } else {
+            self.tabs.remove(i);
+            if i < self.tab {
+                self.tab -= 1;
+            }
+        }
+    }
+
+    /// The name a tab shows.
+    pub fn tab_title(&self, i: usize) -> String {
+        let p = if i == self.tab { &self.cwd } else { &self.tabs[i].cwd };
+        place_title(p)
+    }
+
+    // ---------------------------------------------------------------- Quick Look
+
+    /// The entry Quick Look shows (the keyboard's row, else the one selected).
+    pub fn quick_entry(&self) -> Option<Entry> {
+        let i = self.cursor.or_else(|| self.sel.first().and_then(|p| self.shown.iter().position(|&k| self.entries[k].path == *p)))?;
+        (i < self.shown.len()).then(|| self.at(i).clone())
+    }
+
+    pub fn toggle_quick(&mut self) {
+        self.quick = !self.quick && self.quick_entry().is_some();
+        self.quick_scroll = 0.0;
     }
 
     // ---------------------------------------------------------------- keys
@@ -577,6 +867,41 @@ impl FilesApp {
         }
         if self.props.is_some() && matches!(key, Key::Esc | Key::Enter) {
             self.props = None;
+            return;
+        }
+        if self.ask.is_some() || self.picker.is_some() {
+            if key == Key::Esc {
+                if let Some(a) = self.ask.take() {
+                    a.answer(jobs::Answer::Skip, false);
+                }
+                self.picker = None;
+            } else if let (Some(p), Key::Up | Key::Down) = (self.picker.as_mut(), key) {
+                let n = p.list.len().max(1);
+                p.chosen = if key == Key::Up { (p.chosen + n - 1) % n } else { (p.chosen + 1) % n };
+            } else if key == Key::Enter && self.picker.is_some() {
+                self.picker_open();
+            }
+            return;
+        }
+        if self.quick {
+            match key {
+                Key::Esc | Key::Char(' ') => self.quick = false,
+                Key::Enter => {
+                    self.quick = false;
+                    if let Some(i) = self.cursor {
+                        self.open(i);
+                    }
+                }
+                Key::Left | Key::Up => {
+                    self.move_cursor(-1, false);
+                    self.quick_scroll = 0.0;
+                }
+                Key::Right | Key::Down => {
+                    self.move_cursor(1, false);
+                    self.quick_scroll = 0.0;
+                }
+                _ => {}
+            }
             return;
         }
         let grid = self.prefs.view != ViewMode::Details;
@@ -602,6 +927,8 @@ impl FilesApp {
                 }
             }
             Key::Left => self.go_up(),
+            Key::PageDown if mods.ctrl => self.switch_tab((self.tab + 1) % self.tabs.len()),
+            Key::PageUp if mods.ctrl => self.switch_tab((self.tab + self.tabs.len() - 1) % self.tabs.len()),
             Key::PageDown => self.move_cursor(10 * cols, shift),
             Key::PageUp => self.move_cursor(-10 * cols, shift),
             Key::Home => self.move_cursor(isize::MIN / 2, shift),
@@ -626,7 +953,10 @@ impl FilesApp {
                 self.sel.clear();
                 self.fm.note.clear();
             }
+            Key::Char(' ') if !mods.ctrl && !mods.alt => self.toggle_quick(),
             Key::Char(c) if mods.ctrl => match c {
+                't' => self.new_tab(self.cwd.clone()),
+                'w' => self.close_tab(self.tab, host),
                 'a' => self.command(cmd::SELECT_ALL, host),
                 'c' => self.command(cmd::COPY, host),
                 'x' => self.command(cmd::CUT, host),
@@ -643,7 +973,7 @@ impl FilesApp {
                 '=' | '+' => self.command(actions::ZOOM_IN, host),
                 '-' => self.command(actions::ZOOM_OUT, host),
                 'i' => self.command(cmd::PROPERTIES, host),
-                'q' | 'w' => host.quit = true,
+                'q' => host.quit = true,
                 _ => {}
             },
             Key::Char(c) if !mods.alt && !c.is_control() && c != ' ' => {
@@ -661,6 +991,26 @@ impl FilesApp {
             }
             _ => {}
         }
+    }
+}
+
+/// Computer and Recent are places that are not folders of the disk.
+pub(crate) fn pseudo_path(p: &Path) -> bool {
+    fsops::is_computer(p) || places::is_recent(p)
+}
+
+/// What a place is called in a title or a tab.
+pub(crate) fn place_title(p: &Path) -> String {
+    if fsops::is_computer(p) {
+        chebrium::i18n::tr("Computer").into_owned()
+    } else if places::is_recent(p) {
+        chebrium::i18n::tr("Recent Files").into_owned()
+    } else if *p == fsops::home() {
+        chebrium::i18n::tr("Home").into_owned()
+    } else if *p == fsops::trash_path() {
+        chebrium::i18n::tr("Trash").into_owned()
+    } else {
+        p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "/".into())
     }
 }
 
@@ -685,11 +1035,22 @@ impl App for FilesApp {
     fn start(&mut self, waker: Waker) {
         self.icons.start(waker.clone());
         self.watch.start(waker.clone());
+        self.previews.start(waker.clone());
         self.waker = Some(waker);
+        // a search started before the waker was there (a test, a tab restored) is woken from now on
+        if self.searching() {
+            self.restart_search();
+        }
     }
 
-    fn tick(&mut self, _host: &mut Host) {
+    fn tick(&mut self, host: &mut Host) {
         self.poll_mount();
+        if self.poll_jobs() || !self.jobs.is_empty() {
+            host.redraw = true;
+        }
+        if self.take_search() || self.search.as_ref().is_some_and(|s| !s.done()) {
+            host.redraw = true;
+        }
         let ch = self.watch.take();
         if ch.prefs {
             let p = FilesPrefs::load();
@@ -712,6 +1073,9 @@ impl App for FilesApp {
                 self.reload();
             }
         }
+        if ch.prefs {
+            self.bookmarks = places::bookmarks();
+        }
         if self.fm.gen != self.gen {
             self.changed();
         }
@@ -733,15 +1097,61 @@ impl App for FilesApp {
         host.quit |= self.done;
     }
 
-    fn raw_pointer(&mut self, event: &PointerEvt, _mods: &Modifiers, host: &mut Host) -> bool {
-        // the right button opens the menu of what is under it
-        if let PointerKind::Press { button: 0x111, .. } = event.kind {
-            self.last_pointer = event.pos;
-            self.context_menu(event.pos);
-            host.redraw = true;
-            return true;
+    fn raw_key(&mut self, event: &chebrium::app::KeyEvent, mods: &Modifiers, _serial: u32, host: &mut Host) -> bool {
+        use chebrium::app::Keysym;
+        if self.editing || self.menu.is_some() {
+            return false;
         }
-        false
+        let n = self.tabs.len();
+        let done = match event.keysym {
+            Keysym::Tab | Keysym::ISO_Left_Tab if mods.ctrl && n > 1 => {
+                let back = mods.shift || event.keysym == Keysym::ISO_Left_Tab;
+                self.switch_tab(if back { (self.tab + n - 1) % n } else { (self.tab + 1) % n });
+                true
+            }
+            Keysym::F11 => {
+                self.prefs.info_panel = !self.prefs.info_panel;
+                self.save_prefs();
+                true
+            }
+            Keysym::F3 => {
+                self.toggle_quick();
+                true
+            }
+            _ => false,
+        };
+        host.redraw |= done;
+        done
+    }
+
+    fn raw_pointer(&mut self, event: &PointerEvt, _mods: &Modifiers, host: &mut Host) -> bool {
+        match event.kind {
+            // the right button opens the menu of what is under it
+            PointerKind::Press { button: 0x111, .. } => {
+                self.last_pointer = event.pos;
+                self.context_menu(event.pos);
+                host.redraw = true;
+                true
+            }
+            // the middle one opens a folder or a place in a new tab, and closes a tab
+            PointerKind::Press { button: 0x112, .. } => {
+                if let Some((i, _)) = self.tab_rects.iter().find(|(_, r)| chebrium::ui::inside(event.pos, *r)).copied() {
+                    self.close_tab(i, host);
+                } else if let Some(i) = self.entry_at(event.pos).filter(|&i| self.at(i).is_dir) {
+                    let p = self.at(i).path.clone();
+                    self.tabs[self.tab] = self.snapshot();
+                    self.tabs.insert(self.tab + 1, Tab { cwd: p, back: Vec::new(), forward: Vec::new(), sel: Vec::new(), scroll: 0.0, filter: String::new() });
+                } else if let Some((p, _)) = self.place_rects.iter().find(|(_, r)| chebrium::ui::inside(event.pos, *r)).cloned() {
+                    self.tabs[self.tab] = self.snapshot();
+                    self.tabs.insert(self.tab + 1, Tab { cwd: p, back: Vec::new(), forward: Vec::new(), sel: Vec::new(), scroll: 0.0, filter: String::new() });
+                } else {
+                    return false;
+                }
+                host.redraw = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn dropped(&mut self, files: Vec<PathBuf>, _text: String, host: &mut Host) {
@@ -757,6 +1167,8 @@ impl App for FilesApp {
         if self.fm.gen != self.gen {
             self.changed();
         }
+        self.poll_jobs();
+        self.take_search();
         self.draw_window(ui, size, host);
         // a press on a row and a move: the selected files go out of the window as a drag
         if let Some(p) = &self.press {
